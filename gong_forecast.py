@@ -141,24 +141,35 @@ def _score_signal(value: int, saturation: int) -> float:
     return (1 - math.exp(-value / saturation)) * 100
 
 
-def compute_forecast(num_conversations: int, num_connections: int) -> dict:
+def compute_forecast(
+    num_conversations: int,
+    num_connections: int,
+    recent_conversations: int,
+) -> dict:
     """
     Compute a weighted forecast score from conversation and connection counts.
 
+    Tier rules (checked in order):
+      High   – >3 conversations in the last 14 days OR >3 connections
+      Medium – overall score >= 45
+      Low    – overall score >= 20
+      At Risk – otherwise
+
     Returns a dict with:
-        score             – overall 0–100 forecast score
-        tier              – "High" / "Medium" / "Low" / "At Risk"
-        conversation_score – 0–100 signal score for conversations
-        connection_score   – 0–100 signal score for connections
-        num_conversations  – raw conversation count
-        num_connections    – raw connection count
+        score                – overall 0–100 forecast score
+        tier                 – "High" / "Medium" / "Low" / "At Risk"
+        conversation_score   – 0–100 signal score for conversations
+        connection_score     – 0–100 signal score for connections
+        num_conversations    – raw conversation count (full lookback window)
+        recent_conversations – conversations in the last 14 days
+        num_connections      – raw connection count
     """
     conv_score = _score_signal(num_conversations, CONVERSATION_SATURATION)
     conn_score = _score_signal(num_connections, CONNECTION_SATURATION)
 
     total = CONVERSATION_WEIGHT * conv_score + CONNECTION_WEIGHT * conn_score
 
-    if total >= 75:
+    if recent_conversations > 3 or num_connections > 3:
         tier = "High"
     elif total >= 45:
         tier = "Medium"
@@ -173,6 +184,7 @@ def compute_forecast(num_conversations: int, num_connections: int) -> dict:
         "conversation_score": round(conv_score, 1),
         "connection_score": round(conn_score, 1),
         "num_conversations": num_conversations,
+        "recent_conversations": recent_conversations,
         "num_connections": num_connections,
     }
 
@@ -189,7 +201,8 @@ def print_report(account_label: str, result: dict, lookback_days: int) -> None:
     print(f"  Account        : {account_label}")
     print(f"  Lookback       : {lookback_days} days")
     print(sep)
-    print(f"  Conversations  : {result['num_conversations']}")
+    print(f"  Conversations  : {result['num_conversations']} (last {lookback_days}d)")
+    print(f"  Recent (14d)   : {result['recent_conversations']} conversations")
     print(f"  Connections    : {result['num_connections']}")
     print(sep)
     print(f"  Conv Score     : {result['conversation_score']} / 100")
@@ -247,17 +260,35 @@ def main():
         account_id = args.account_id
         account_label = account_id
 
-    # Build date window
+    # Build date window – always fetch at least 14 days so we can check
+    # the recent-activity threshold even when --days is smaller.
     to_date = datetime.now(timezone.utc)
-    from_date = to_date - timedelta(days=args.days)
+    fetch_days = max(args.days, 14)
+    from_date = to_date - timedelta(days=fetch_days)
+    recent_cutoff = to_date - timedelta(days=14)
 
-    print(f"Fetching conversations (last {args.days} days) ...")
+    print(f"Fetching conversations (last {fetch_days} days) ...")
     calls = client.get_calls_for_account(account_id, from_date, to_date)
+
+    # Count calls within the user-requested window and the last 14 days.
+    window_cutoff = to_date - timedelta(days=args.days)
+    window_calls = [
+        c for c in calls
+        if datetime.fromisoformat(
+            c["metaData"]["started"].replace("Z", "+00:00")
+        ) >= window_cutoff
+    ]
+    recent_calls = [
+        c for c in calls
+        if datetime.fromisoformat(
+            c["metaData"]["started"].replace("Z", "+00:00")
+        ) >= recent_cutoff
+    ]
 
     print("Fetching connections ...")
     contacts = client.get_contacts_for_account(account_id)
 
-    result = compute_forecast(len(calls), len(contacts))
+    result = compute_forecast(len(window_calls), len(contacts), len(recent_calls))
     print_report(account_label, result, args.days)
 
 
